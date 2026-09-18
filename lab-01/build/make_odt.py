@@ -23,12 +23,14 @@ from odf.style import (
     Style, TextProperties, ParagraphProperties, PageLayout, PageLayoutProperties,
     MasterPage, FontFace, GraphicProperties, TableColumnProperties,
     TableProperties, TableCellProperties, FooterStyle, HeaderStyle,
+    TabStops, TabStop,
     PageLayoutProperties as PLP
 )
 from odf.style import Footer, Header
-from odf.text import P, Span, PageNumber, S
+from odf.text import P, Span, PageNumber, S, A, Bookmark
 from odf.draw import Frame, Image as DImage, TextBox
 from odf.table import Table, TableColumn, TableRow, TableCell
+from odf.namespaces import STYLENS
 from odf import teletype
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -39,6 +41,8 @@ OUTNAME = 'Отчёт_ЛР1_Установка_РОСА_на_VMware.odt'
 
 sys.path.insert(0, BASE)
 import content
+from xref import split_refs
+from make_report import build_pdf, counts_for, toc_entries
 
 # ----------- параметры страницы -----------
 PAGE = dict(width=21.0, height=29.7,
@@ -198,9 +202,9 @@ def build():
     # по центру без отступа (для рисунков)
     add_pstyle('Center', align='center', indent=0, before='0.2cm',
                after='0cm', keepnext=True)
-    # подпись к рисунку
+    # подпись к рисунку — курсивом
     add_pstyle('FigCaption', align='center', indent=0, before='0.2cm',
-               after=pt(21), keepnext=True)
+               after=pt(21), keepnext=True, italic=True)
     # название таблицы
     add_pstyle('TabCaption', align='left', indent=0, before='0.4cm',
                after='0.2cm', keepnext=True)
@@ -213,10 +217,9 @@ def build():
     # заголовок раздела (1 Название)
     add_pstyle('H1', align='left', indent=PAGE['indent'],
                before='0cm', after=pt(21), keepnext=True, bold=True)
-    # заголовок подраздела (1.1) — разреженный на 3 пт
+    # заголовок подраздела (1.1) — стандарт, полужирный
     add_pstyle('H2', align='left', indent=PAGE['indent'],
-               before='0cm', after=pt(21), keepnext=True, bold=True,
-               spacing=3)
+               before='0cm', after=pt(21), keepnext=True, bold=True)
     # заголовок структурного элемента (ВВЕДЕНИЕ и т.п.) — с новой стр, по центру, жирный
     add_pstyle('Struct', align='center', indent=0, before='0cm',
                after=pt(21), keepnext=True, bold=True, pagebreak=True)
@@ -246,6 +249,12 @@ def build():
     s_footer_t.addElement(TextProperties(fontname=FONT, fontfamily="'%s'" % FONT,
                                           fontsize=pt(PAGE['size'])))
     doc.styles.addElement(s_footer_t)
+    # перекрёстная ссылка на рисунок — серым, без подчёркивания
+    s_xref = Style(name='XRef', family='text')
+    s_xref.addElement(TextProperties(fontname=FONT, fontfamily="'%s'" % FONT,
+                                      fontsize=pt(PAGE['size']), color='#808080',
+                                      textunderlinestyle='none'))
+    doc.styles.addElement(s_xref)
 
     # Стили титульного листа
     def cover_style(name, *, bold=False, italic=False, size=14, lead=18, center=True):
@@ -269,9 +278,11 @@ def build():
     cover_style('CVi', italic=True, size=12, lead=15)
     # первый параграф титула — переключает на титульную master-page
     s_cover_first = Style(name='CoverFirst', family='paragraph', masterpagename='MP_Cover')
+    # Титульный лист — одна страница: разрыв ставит не первый абзац, а первый
+    # структурный элемент (РЕФЕРАТ) через breakbefore='page'.
     s_cover_first.addElement(ParagraphProperties(
         textalign='center', textindent='0cm', margintop='0pt', marginbottom='0pt',
-        linespacing=pt(18), breakafter='page'))
+        linespacing=pt(18)))
     s_cover_first.addElement(TextProperties(fontname=FONT, fontfamily="'%s'" % FONT,
                                              fontsize=pt(14), fontweight='bold'))
     doc.automaticstyles.addElement(s_cover_first)
@@ -305,7 +316,6 @@ def build():
     # -------- сборка документа --------
     body = doc.text
     fig_no = [0]
-    toc_styles_made = set()
 
     def add_fig(fname, caption):
         fig_no[0] += 1
@@ -317,8 +327,10 @@ def build():
         fr.addElement(DImage(href=doc.addPicture(path)))
         p.addElement(fr)
         body.addElement(p)
-        body.addElement(P(stylename='FigCaption',
-                          text='Рисунок %d – %s' % (fig_no[0], caption)))
+        capp = P(stylename='FigCaption')
+        capp.addElement(Bookmark(name='fig%d' % fig_no[0]))
+        capp.addText('Рисунок %d – %s' % (fig_no[0], caption))
+        body.addElement(capp)
 
     def add_table(spec):
         body.addElement(P(stylename='TabCaption', text=spec['caption']))
@@ -388,16 +400,63 @@ def build():
             for _ in range(n):
                 body.addElement(P(stylename=st, text=' '))
 
-    # ---- подсчёт для реферата ----
+    # ---- подсчёт для реферата + карта «заголовок -> страница» из PDF-сборки ----
     n_figs = sum(1 for b in content.SECTIONS if b[0] == 'fig')
     n_tables = sum(1 for b in content.SECTIONS if b[0] == 'table')
-    counts = dict(pages=27, figs=n_figs, tables=n_tables, sources=len(content.REFS))
+    import tempfile
+    _tmp_pdf = os.path.join(tempfile.gettempdir(), '_seroov_pages.pdf')
+    counts = counts_for({'pages': 0})
+    counts['figs'] = n_figs
+    counts['tables'] = n_tables
+    pages_map, n_pages = {}, 0
+    for _ in range(4):
+        pages_map, n_pages = build_pdf(_tmp_pdf, counts)
+        if counts['pages'] == n_pages:
+            break
+        counts = counts_for({'pages': n_pages})
+        counts['figs'] = n_figs
+        counts['tables'] = n_tables
 
     def fmt(t):
         try:
             return t.format(**counts)
         except Exception:
             return t
+
+    def add_text_para(text, style='Normal'):
+        """Абзац, в котором «рисунок N» — серая перекрёстная ссылка на закладку."""
+        p = P(stylename=style)
+        for tok in split_refs(text, n_figs):
+            if tok[0] == 't':
+                p.addText(tok[1])
+            else:
+                a = A(href='#fig%d' % tok[2])
+                sp = Span(stylename='XRef')
+                sp.addText(tok[1])
+                a.addElement(sp)
+                p.addElement(a)
+        body.addElement(p)
+
+    # ---- стили содержания с отточием и номером страницы справа ----
+    for lvl in (0, 1):
+        st = Style(name='Toc%d' % lvl, family='paragraph')
+        pp = ParagraphProperties(textalign='left', textindent='0cm',
+                                 marginleft=cm(lvl * 0.5), margintop='0cm',
+                                 marginbottom='0cm', linespacing=pt(21))
+        ts = TabStops()
+        _tab = TabStop(
+            position=cm(PAGE['width'] - PAGE['mleft'] - PAGE['mright'] - lvl * 0.5),
+            type='right')
+        # odfpy не знает style:leader-char — добавляем атрибут напрямую
+        # (LibreOffice рисует по нему отточие до номера страницы).
+        _tab.attributes[(STYLENS, 'leader-char')] = '.'
+        _tab.attributes[(STYLENS, 'leader-style')] = 'none'
+        ts.addElement(_tab)
+        pp.addElement(ts)
+        st.addElement(pp)
+        st.addElement(TextProperties(fontname=FONT, fontfamily="'%s'" % FONT,
+                                      fontsize=pt(PAGE['size'])))
+        doc.styles.addElement(st)
 
     first_struct = True
     for block in content.SECTIONS:
@@ -414,7 +473,7 @@ def build():
         elif k == 'h2':
             body.addElement(P(stylename='H2', text=block[1]))
         elif k == 'p':
-            body.addElement(P(stylename='Normal', text=fmt(block[1])))
+            add_text_para(fmt(block[1]))
         elif k == 'list':
             for item in block[1]:
                 body.addElement(P(stylename='DashList', text='– ' + item))
@@ -422,35 +481,10 @@ def build():
             for i, item in enumerate(block[1], 1):
                 body.addElement(P(stylename='Refs', text='%d %s' % (i, item)))
         elif k == 'toc':
-            # Структура содержания вручную с отточиями
-            toc_items = [
-                (0, 'ВВЕДЕНИЕ'),
-                (0, '1 Операционная система «РОСА» и особенности установки дистрибутивов семейства Red Hat'),
-                (1, '1.1 Общие сведения об операционной системе «РОСА»'),
-                (1, '1.2 Особенности установки дистрибутивов семейства Red Hat'),
-                (1, '1.3 Режимы сетевого взаимодействия виртуальных машин в VMware Workstation'),
-                (0, '2 Используемое программное обеспечение и параметры виртуальной машины'),
-                (0, '3 Создание виртуальной машины'),
-                (0, '4 Установка операционной системы'),
-                (0, 'ЗАКЛЮЧЕНИЕ'),
-                (0, 'СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ'),
-            ]
-            for lvl, t in toc_items:
-                style = 'Toc1' if lvl == 0 else 'Toc2'
-                # стиль для СОДЕРЖАНИЯ создадим на лету
-                sn = 'Toc%d' % lvl
-                if sn not in toc_styles_made:
-                    st = Style(name=sn, family='paragraph')
-                    st.addElement(ParagraphProperties(
-                        textalign='left', textindent='0cm',
-                        marginleft=cm(lvl * 0.5),
-                        margintop='0cm', marginbottom='0cm',
-                        linespacing=pt(21)))
-                    st.addElement(TextProperties(fontname=FONT, fontfamily="'%s'" % FONT,
-                                                  fontsize=pt(PAGE['size'])))
-                    doc.styles.addElement(st)
-                    toc_styles_made.add(sn)
-                body.addElement(P(stylename=sn, text=t))
+            # Название -> отточие -> номер страницы (номера из PDF-сборки)
+            for lvl, text, page in toc_entries(pages_map):
+                body.addElement(P(stylename='Toc%d' % lvl,
+                                  text='%s\t%s' % (text, page)))
         elif k == 'fig':
             add_fig(block[1], block[2])
         elif k == 'table':

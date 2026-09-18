@@ -25,6 +25,10 @@ FONTS = os.path.join(BASE, 'fonts')
 
 sys.path.insert(0, BASE)
 import content  # noqa: E402
+import re
+from xml.sax.saxutils import escape as xml_escape
+
+from xref import split_refs, REF_RE  # noqa: E402
 
 # ----------------------------------------------------------------- параметры страницы
 # Вариант «ГОСТ 7.32-2017»: поля 30/15/20/20 мм, абзацный отступ 1,25 см.
@@ -140,8 +144,8 @@ def build_docx(page_map, path, counts):
             rpr.append(el)
         el.set(qn('w:val'), str(int(pt * 20)))
 
-    # --- заголовки разделов (уровень 1) и подразделов (уровень 2, разреженный на 3 пт)
-    for name, spacing in (('Heading 1', 0), ('Heading 2', 3)):
+    # --- заголовки разделов (уровень 1) и подразделов (уровень 2) — стандарт, полужирный
+    for name, spacing in (('Heading 1', 0), ('Heading 2', 0)):
         st = doc.styles[name]
         st.font.name = TNR
         st.font.size = Pt(SIZE)
@@ -181,7 +185,7 @@ def build_docx(page_map, path, counts):
         return st
 
     cap_style = make_style('FigureCaption', align=WD_ALIGN_PARAGRAPH.CENTER, indent=0,
-                           before=6, after=PAGE['leading'], keep=True)
+                           before=6, after=PAGE['leading'], keep=True, italic=True)
     tab_cap_style = make_style('TableCaption', align=WD_ALIGN_PARAGRAPH.LEFT, indent=0,
                                before=12, after=6, keep=True)
     list_style = make_style('ListGOST')
@@ -216,6 +220,39 @@ def build_docx(page_map, path, counts):
         r.bold = bool(line.get('b'))
         r.italic = bool(line.get('i'))
 
+    max_fig = sum(1 for b in content.SECTIONS if b[0] == 'fig')
+
+    def add_xref(par, anchor, text):
+        """Серая перекрёстная ссылка (внутренняя гиперссылка) на закладку рисунка."""
+        hyperlink = OxmlElement('w:hyperlink')
+        hyperlink.set(qn('w:anchor'), anchor)
+        run = OxmlElement('w:r')
+        rpr = OxmlElement('w:rPr')
+        rf = OxmlElement('w:rFonts')
+        for a in ('w:ascii', 'w:hAnsi', 'w:cs', 'w:eastAsia'):
+            rf.set(qn(a), TNR)
+        sz = OxmlElement('w:sz'); sz.set(qn('w:val'), str(SIZE * 2))
+        szc = OxmlElement('w:szCs'); szc.set(qn('w:val'), str(SIZE * 2))
+        col = OxmlElement('w:color'); col.set(qn('w:val'), '808080')
+        nound = OxmlElement('w:u'); nound.set(qn('w:val'), 'none')
+        for el in (rf, sz, szc, col, nound):
+            rpr.append(el)
+        run.append(rpr)
+        t = OxmlElement('w:t'); t.set(qn('xml:space'), 'preserve'); t.text = text
+        run.append(t)
+        hyperlink.append(run)
+        par._p.append(hyperlink)
+
+    def add_para(text, style='Normal'):
+        """Абзац, в котором «рисунок N» — серая перекрёстная ссылка."""
+        par = doc.add_paragraph(style=style)
+        for tok in split_refs(text, max_fig):
+            if tok[0] == 't':
+                par.add_run(tok[1])
+            else:
+                add_xref(par, 'fig%d' % tok[2], tok[1])
+        return par
+
     fig_no = [0]
 
     def add_figure(fname, caption):
@@ -227,6 +264,12 @@ def build_docx(page_map, path, counts):
         par.paragraph_format.keep_with_next = True
         par.add_run().add_picture(path_img, width=Cm(w_cm), height=Cm(h_cm))
         cap = doc.add_paragraph(style='FigureCaption')
+        bs = OxmlElement('w:bookmarkStart')
+        bs.set(qn('w:id'), str(1000 + fig_no[0]))
+        bs.set(qn('w:name'), 'fig%d' % fig_no[0])
+        be = OxmlElement('w:bookmarkEnd')
+        be.set(qn('w:id'), str(1000 + fig_no[0]))
+        cap._p.append(bs); cap._p.append(be)
         cap.add_run('Рисунок %d – %s' % (fig_no[0], caption))
 
     def add_table(spec):
@@ -267,7 +310,7 @@ def build_docx(page_map, path, counts):
             p.paragraph_format.page_break_before = True
             p.add_run(block[1])
         elif kind == 'p':
-            doc.add_paragraph(format_text(block[1], counts), style='Normal')
+            add_para(format_text(block[1], counts), 'Normal')
         elif kind == 'list':
             for item in block[1]:
                 doc.add_paragraph('– ' + item, style='ListGOST')
@@ -324,12 +367,23 @@ def build_pdf(path, counts):
                           alignment=TA_JUSTIFY, firstLineIndent=IND)
     h1 = ParagraphStyle('h1', parent=body, fontName='Tinos-Bold', alignment=TA_LEFT,
                         spaceBefore=0, spaceAfter=BLANK, keepWithNext=1)
-    h2 = ParagraphStyle('h2', parent=h1, charSpace=3, spaceBefore=0, spaceAfter=BLANK,
+    h2 = ParagraphStyle('h2', parent=h1, spaceBefore=0, spaceAfter=BLANK,
                         keepWithNext=1)
     h1c = ParagraphStyle('h1c', parent=body, fontName='Tinos-Bold', alignment=TA_CENTER,
                          firstLineIndent=0, spaceBefore=0, spaceAfter=BLANK, keepWithNext=1)
-    cap = ParagraphStyle('cap', parent=body, alignment=TA_CENTER, firstLineIndent=0,
-                         spaceBefore=6, spaceAfter=BLANK)
+    cap = ParagraphStyle('cap', parent=body, fontName='Tinos-Italic', alignment=TA_CENTER,
+                         firstLineIndent=0, spaceBefore=6, spaceAfter=BLANK)
+
+    def pdf_para_text(text):
+        """Экранирует текст и заменяет «рисунок N» на серую внутр. ссылку на закладку."""
+        esc = xml_escape(text)
+
+        def sub(m):
+            n = int(re.search(r'\d+', m.group(0)).group())
+            return ('<a href="#fig%d"><font color="#808080">%s</font></a>'
+                    % (n, m.group(0)))
+
+        return REF_RE.sub(sub, esc)
     tabcap = ParagraphStyle('tabcap', parent=body, alignment=TA_LEFT, firstLineIndent=0,
                             spaceBefore=12, spaceAfter=6, keepWithNext=1)
     li = ParagraphStyle('li', parent=body, firstLineIndent=IND)
@@ -392,7 +446,8 @@ def build_pdf(path, counts):
         story.append(KeepTogether([
             Spacer(1, 6),
             RLImage(p, width=w_cm * cm, height=h_cm * cm),
-            Paragraph('Рисунок %d – %s' % (fig_no[0], caption), cap),
+            Paragraph('<a name="fig%d"/>Рисунок %d – %s'
+                      % (fig_no[0], fig_no[0], xml_escape(caption)), cap),
         ]))
 
     for block in content.SECTIONS:
@@ -405,7 +460,7 @@ def build_pdf(path, counts):
             story.append(PageBreak())
             story.append(Paragraph(block[1], h1c))
         elif kind == 'p':
-            story.append(Paragraph(format_text(block[1], counts), body))
+            story.append(Paragraph(pdf_para_text(format_text(block[1], counts)), body))
         elif kind == 'list':
             for item in block[1]:
                 story.append(Paragraph('– ' + item, li))
